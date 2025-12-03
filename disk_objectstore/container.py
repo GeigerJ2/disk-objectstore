@@ -17,6 +17,8 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, overload
 
+from sqlalchemy import cast as sql_cast
+from sqlalchemy import or_
 from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.orm.session import Session
 from sqlalchemy.sql import func
@@ -83,21 +85,20 @@ class Container:  # pylint: disable=too-many-public-methods
     # NOTE: It MUST be an integer and it MUST be < 0 to avoid collisions with 'actual' packs
     _REPACK_PACK_ID = -1
 
-    # When performing an `in_` query in SQLite, this is converted to something like
+    # NOTE: This parameter is now obsolete after implementing json_each() for large IN clauses.
+    # Previously, when performing an `in_` query in SQLite, this was converted to something like
     # 'SELECT * FROM db_object WHERE db_object.hashkey IN (?, ?)' with parameters = ('hash1', 'hash2')
-    # Now, the maximum number of parameters is limited in SQLite, see variable SQLITE_MAX_VARIABLE_NUMBER
+    # The maximum number of parameters is limited in SQLite, see variable SQLITE_MAX_VARIABLE_NUMBER
     # as described in https://www.sqlite.org/limits.html
-    # Now, until recently (at the moment of writing) this defaults to 999 for SQLite versions
-    # prior to 3.32.0 (2020-05-22) or 32766 for SQLite versions after 3.32.0.
-    # So we need to assume that we cannot put more than 999 elements in the `.in_` parameter.
-    # Note that on some OSs, the value is increased at compile time. E.g. on my Mac OS X with python 3.6
-    # compiled with HomeBrew, the limit (I tested it) is 250000.
+    # This defaults to 999 for SQLite versions prior to 3.32.0 (2020-05-22) or 32766 for newer versions.
+    # We now use json_each() to pass large lists as a single JSON parameter, avoiding this limit entirely.
+    # This constant is kept for backward compatibility but is no longer used in the code.
     # See also e.g. this comment https://bugzilla.redhat.com/show_bug.cgi?id=1798134
     _IN_SQL_MAX_LENGTH = 950
 
-    # If the length of required elements is larger than this, instead of iterating an IN statement over chunks of size
-    # _IN_SQL_MAX_LENGTH, it just quickly lists all elements (ordered by hashkey, requires a VACUUMed DB for
-    # performance) and returns only the intersection.
+    # If the length of required elements is larger than this, instead of using an IN statement,
+    # it quickly lists all elements (ordered by hashkey, requires a VACUUMed DB for performance)
+    # and returns only the intersection. This is more efficient for very large result sets.
     # This length might need some benchmarking, but seems OK on very large DBs of 6M nodes
     # (after VACUUMing, as mentioned above).
     _MAX_CHUNK_ITERATE_LENGTH = 9500
@@ -218,6 +219,52 @@ class Container:  # pylint: disable=too-many-public-methods
                 create=False,
             )
         return self._operation_session
+
+    def _create_smarter_in_clause(self, column, values_list):
+        """Create an IN clause using json_each() to avoid SQLite parameter limits.
+
+        This method uses json_each() to pass large lists as a single JSON parameter
+        instead of N parameters, avoiding SQLite's SQLITE_MAX_VARIABLE_NUMBER limit.
+
+        For very large lists (>500k items), automatically batches into multiple OR'd
+        conditions to balance query performance with memory usage and database load.
+
+        :param column: The SQLAlchemy column to filter on
+        :param values_list: List of values to match against
+        :return: SQLAlchemy filter expression
+        """
+        batch_threshold = 500_000
+
+        # For very large lists, batch to avoid memory/performance issues
+        # Recursion depth is always exactly 2:
+        # - First call: splits list into batches of ≤500k items each
+        # - Recursive calls: each batch is ≤500k, so hits base case immediately
+        if len(values_list) > batch_threshold:
+            batches = []
+            for chunk in chunk_iterator(values_list, batch_threshold):
+                # Recursively call with smaller batch (will use json_each in base case)
+                batches.append(self._create_smarter_in_clause(column, chunk))
+            # Combine all batches with OR: (col IN batch1) OR (col IN batch2) OR ...
+            return or_(*batches)
+
+        # Base case: use json_each() for lists ≤500k items
+        # SQLite: Use json_each() with JSON array (SQLite has no native array type)
+        # - Serialize Python list to JSON string
+        # - json_each() extracts values from JSON, but returns them as TEXT
+        # - sql_cast: Generate SQL CAST() to convert TEXT to target column type
+        # Result: column IN (SELECT CAST(value AS coltype) FROM json_each(:json_param))
+        coltype = column.type
+        json_array = json.dumps(list(values_list))
+
+        # Create table-valued function: json_each(json_array) returns virtual table
+        json_each_table = func.json_each(json_array).table_valued('value')
+
+        # Extract the 'value' column and cast from TEXT to target type
+        value_col = json_each_table.c.value
+        subq = select(sql_cast(value_col, coltype)).select_from(json_each_table).scalar_subquery()
+
+        # Return the IN clause: column IN (subquery)
+        return column.in_(subq)
 
     def _get_loose_path_from_hashkey(self, hashkey: str) -> Path:
         """Return the path of a loose object on disk containing the data of a given hash key.
@@ -579,19 +626,17 @@ class Container:  # pylint: disable=too-many-public-methods
         obj_reader: StreamReadBytesType
 
         if len(hashkeys_set) <= self._MAX_CHUNK_ITERATE_LENGTH:
-            # Operate in chunks, due to the SQLite limits
-            # (see comment above the definition of self._IN_SQL_MAX_LENGTH)
-            for chunk in chunk_iterator(hashkeys_set, size=self._IN_SQL_MAX_LENGTH):
-                stmt = select(
-                    Obj.pack_id,
-                    Obj.hashkey,
-                    Obj.offset,
-                    Obj.length,
-                    Obj.compressed,
-                    Obj.size,
-                ).where(Obj.hashkey.in_(chunk))
-                for res in session.execute(stmt):
-                    packs[res[0]].append(ObjQueryResults(res[1], res[2], res[3], res[4], res[5]))
+            # Use json_each() to pass the entire list as a single parameter, avoiding SQLite limits
+            stmt = select(
+                Obj.pack_id,
+                Obj.hashkey,
+                Obj.offset,
+                Obj.length,
+                Obj.compressed,
+                Obj.size,
+            ).where(self._create_smarter_in_clause(Obj.hashkey, hashkeys_set))
+            for res in session.execute(stmt):
+                packs[res[0]].append(ObjQueryResults(res[1], res[2], res[3], res[4], res[5]))
         else:
             sorted_hashkeys = sorted(hashkeys_set)
             pack_iterator = session.execute(
@@ -717,17 +762,17 @@ class Container:  # pylint: disable=too-many-public-methods
             packs = defaultdict(list)
             session = self._get_operation_session()
             if len(loose_not_found) <= self._MAX_CHUNK_ITERATE_LENGTH:
-                for chunk in chunk_iterator(loose_not_found, size=self._IN_SQL_MAX_LENGTH):
-                    stmt = select(
-                        Obj.pack_id,
-                        Obj.hashkey,
-                        Obj.offset,
-                        Obj.length,
-                        Obj.compressed,
-                        Obj.size,
-                    ).where(Obj.hashkey.in_(chunk))
-                    for res in session.execute(stmt):
-                        packs[res[0]].append(ObjQueryResults(res[1], res[2], res[3], res[4], res[5]))
+                # Use json_each() to pass the entire list as a single parameter, avoiding SQLite limits
+                stmt = select(
+                    Obj.pack_id,
+                    Obj.hashkey,
+                    Obj.offset,
+                    Obj.length,
+                    Obj.compressed,
+                    Obj.size,
+                ).where(self._create_smarter_in_clause(Obj.hashkey, loose_not_found))
+                for res in session.execute(stmt):
+                    packs[res[0]].append(ObjQueryResults(res[1], res[2], res[3], res[4], res[5]))
             else:
                 sorted_hashkeys = sorted(loose_not_found)
                 pack_iterator = session.execute(
@@ -1314,11 +1359,10 @@ class Container:  # pylint: disable=too-many-public-methods
         existing_packed_hashkeys = []
 
         if len(loose_objects) <= self._MAX_CHUNK_ITERATE_LENGTH:
-            for chunk in chunk_iterator(loose_objects, size=self._IN_SQL_MAX_LENGTH):
-                # I check the hash keys that are already in the pack
-                stmt = select(Obj.hashkey).where(Obj.hashkey.in_(chunk))
-                for res in session.execute(stmt):
-                    existing_packed_hashkeys.append(res[0])
+            # Use json_each() to pass the entire list as a single parameter, avoiding SQLite limits
+            stmt = select(Obj.hashkey).where(self._create_smarter_in_clause(Obj.hashkey, loose_objects))
+            for res in session.execute(stmt):
+                existing_packed_hashkeys.append(res[0])
         else:
             sorted_hashkeys = sorted(loose_objects)
             pack_iterator = session.execute(text('SELECT hashkey FROM db_object ORDER BY hashkey'))
@@ -2001,11 +2045,10 @@ class Container:  # pylint: disable=too-many-public-methods
         # I search now for all loose hash keys that exist also in the packs
         existing_packed_hashkeys = []
         if len(loose_objects) <= self._MAX_CHUNK_ITERATE_LENGTH:
-            for chunk in chunk_iterator(loose_objects, size=self._IN_SQL_MAX_LENGTH):
-                # I check the hash keys that are already in the pack
-                stmt = select(Obj.hashkey).where(Obj.hashkey.in_(chunk))
-                for row in session.execute(stmt):
-                    existing_packed_hashkeys.append(row[0])
+            # Use json_each() to pass the entire list as a single parameter, avoiding SQLite limits
+            stmt = select(Obj.hashkey).where(self._create_smarter_in_clause(Obj.hashkey, loose_objects))
+            for row in session.execute(stmt):
+                existing_packed_hashkeys.append(row[0])
         else:
             sorted_hashkeys = sorted(loose_objects)
             pack_iterator = session.execute(text('SELECT hashkey FROM db_object ORDER BY hashkey'))
@@ -2488,19 +2531,19 @@ class Container:  # pylint: disable=too-many-public-methods
 
         session = self._get_operation_session()
 
-        # Operate in chunks, due to the SQLite limits
-        # (see comment above the definition of self._IN_SQL_MAX_LENGTH)
-        for chunk in chunk_iterator(hashkeys, size=self._IN_SQL_MAX_LENGTH):
-            results = session.execute(select(Obj.hashkey).where(Obj.hashkey.in_(chunk)))
-            deleted_this_chunk = [res[0] for res in results]
-            # I need to specify either `False` or `'fetch'`
-            # otherwise one gets 'sqlalchemy.exc.InvalidRequestError: Could not evaluate current criteria in Python'
-            # `'fetch'` will run the query twice so it's less efficient
-            # False is beter but one needs to either `expire_all` at the end, or commit.
-            # I will commit at the end.
-            stmt = delete(Obj).where(Obj.hashkey.in_(chunk)).execution_options(synchronize_session=False)
-            session.execute(stmt)
-            deleted_packed.update(deleted_this_chunk)
+        # Use json_each() to pass the entire list as a single parameter, avoiding SQLite limits
+        results = session.execute(select(Obj.hashkey).where(self._create_smarter_in_clause(Obj.hashkey, hashkeys)))
+        deleted_this_batch = [res[0] for res in results]
+        # I need to specify either `False` or `'fetch'`
+        # otherwise one gets 'sqlalchemy.exc.InvalidRequestError: Could not evaluate current criteria in Python'
+        # `'fetch'` will run the query twice so it's less efficient
+        # False is beter but one needs to either `expire_all` at the end, or commit.
+        # I will commit at the end.
+        stmt = delete(Obj).where(self._create_smarter_in_clause(Obj.hashkey, hashkeys)).execution_options(
+            synchronize_session=False
+        )
+        session.execute(stmt)
+        deleted_packed.update(deleted_this_batch)
 
         session.commit()
 
