@@ -3,6 +3,8 @@ exclude_lines =
     pragma: no cover
     @overload
     if TYPE_CHECKING:
+    # Protocol method bodies / abstract stubs are just `...` and never run.
+    ^\s*\.\.\.\s*$
 [run]
 omit =
     disk_objectore/examples/*

@@ -923,6 +923,48 @@ def test_packed_object_reader():
         assert packed_reader.read() == bytestream[offset:]
 
 
+# TODO: add test for `\r`, as well
+def test_packed_object_reader_readline():
+    """Test the readline() behavior of PackedObjectReader."""
+    bytestream = b'000HEADER\nline1\nline2\nlastline_no_nlXXTAIL'
+
+    offset = 3
+    length = len(b'HEADER\nline1\nline2\nlastline_no_nlXX')
+    expected_slice = bytestream[offset : offset + length]
+    expected_lines = expected_slice.splitlines(keepends=True)
+
+    with tempfile.NamedTemporaryFile(mode='wb', delete=False) as tempfhandle:
+        tempfhandle.write(bytestream)
+        fname = tempfhandle.name
+
+    with open(fname, 'rb') as fhandle:
+        pr = utils.PackedObjectReader(fhandle, offset=offset, length=length)
+        lines = []
+        while True:
+            line = pr.readline()
+            if not line:
+                break
+            lines.append(line)
+        assert lines == expected_lines
+
+        # After EOF, another readline() must return b""
+        assert pr.readline() == b''
+
+    limit = 4
+    with open(fname, 'rb') as fhandle:
+        pr = utils.PackedObjectReader(fhandle, offset=offset, length=length)
+        chunks = []
+        while True:
+            chunk = pr.readline(limit)
+            if not chunk:
+                break
+            # Each returned chunk must be <= limit (unless limit < 0)
+            assert len(chunk) <= limit
+            chunks.append(chunk)
+        # Concatenation of limited chunks must equal the original slice
+        assert b''.join(chunks) == expected_slice
+
+
 def test_packed_object_reader_seek(tmp_path):
     """Test the `PackedObjectReader.seek` method."""
     bytestream = b'0123456789abcdef'
@@ -1105,6 +1147,89 @@ def test_stream_decompresser(compression_algorithm):
         data = b''.join(data_chunks)
 
         assert original == data, 'Uncompressed data is wrong (chunked read)'
+
+
+@pytest.mark.parametrize('compression_algorithm', COMPRESSION_ALGORITHMS_TO_TEST)
+def test_stream_decompresser_multichunk(compression_algorithm):
+    """Regression test for decompression spanning multiple internal chunks.
+
+    Reading decompresses up to ``_CHUNKSIZE`` bytes at a time into an internal buffer.
+    A buggy implementation re-fed the same compressed chunk to the decompressor on every
+    iteration instead of feeding back ``unconsumed_tail``, replaying already-consumed bytes
+    and raising ``Error while uncompressing data`` for any object large enough (or
+    incompressible enough) to require more than one decompression step. This exercises both
+    ``read`` and ``readline``/``readlines`` over such an object to guard against a recurrence.
+    """
+    StreamDecompresser = utils.get_stream_decompresser(  # pylint: disable=invalid-name
+        compression_algorithm
+    )
+    chunksize = utils.ZlibLikeBaseStreamDecompresser._CHUNKSIZE  # pylint: disable=protected-access
+
+    # Incompressible payload several `_CHUNKSIZE`s long, with a few newlines so `readline`
+    # also has to walk across chunk boundaries. The odd `+ 17` avoids chunk-size alignment.
+    body = os.urandom(3 * chunksize + 17)
+    original = b'\n'.join([body, body, body]) + b'\n'
+
+    def make_decompresser():
+        compresser = utils.get_compressobj_instance(compression_algorithm)
+        compressed = compresser.compress(original) + compresser.flush()
+        return StreamDecompresser(io.BytesIO(compressed))
+
+    # Full read must round-trip exactly.
+    assert make_decompresser().read() == original
+
+    # readlines() must reconstruct the original.
+    assert b''.join(make_decompresser().readlines()) == original
+
+    # readline() called repeatedly must reconstruct the original and split only on `\n`.
+    decompresser = make_decompresser()
+    lines = []
+    while True:
+        line = decompresser.readline()
+        if not line:
+            break
+        lines.append(line)
+    assert b''.join(lines) == original
+    # `original` ends with `\n`, so every line (including the last) ends with `\n` and the
+    # number of lines equals the number of newlines. Note `bytes.splitlines` is not a valid
+    # oracle here: it also splits on `\r`, `\v`, `\f`, ..., which random bytes contain.
+    assert all(line.endswith(b'\n') for line in lines)
+    assert len(lines) == original.count(b'\n')
+
+
+@pytest.mark.parametrize('compression_algorithm', COMPRESSION_ALGORITHMS_TO_TEST)
+def test_stream_decompresser_readline_many_short_lines(compression_algorithm):
+    """`readline` over many short lines spanning several internal buffers.
+
+    This is the scenario the buffer-offset consumption targets: each line is located and
+    consumed within the buffer (advancing the offset, no re-slicing), and the buffer is
+    refilled between lines. The payload is a few ``_CHUNKSIZE``s of distinct numbered
+    lines, so both the offset advance and the cross-buffer refill are exercised, and a
+    dropped/duplicated/reordered line would change the result. Asserted here (not only in
+    the benchmarks, which CI skips) so the path is covered in the normal test run.
+    """
+    StreamDecompresser = utils.get_stream_decompresser(  # pylint: disable=invalid-name
+        compression_algorithm
+    )
+    chunksize = utils.ZlibLikeBaseStreamDecompresser._CHUNKSIZE  # pylint: disable=protected-access
+
+    num_lines = (3 * chunksize) // 16  # ~1 MB of 11-byte lines: several buffer refills
+    original = b''.join(b'%010d\n' % i for i in range(num_lines))
+    expected_lines = original.splitlines(keepends=True)
+
+    compresser = utils.get_compressobj_instance(compression_algorithm)
+    compressed = compresser.compress(original) + compresser.flush()
+    decompresser = StreamDecompresser(io.BytesIO(compressed))
+
+    lines = []
+    while True:
+        line = decompresser.readline()
+        if not line:
+            break
+        lines.append(line)
+
+    assert lines == expected_lines
+    assert b''.join(lines) == original
 
 
 @pytest.mark.parametrize('compression_algorithm', COMPRESSION_ALGORITHMS_TO_TEST)
@@ -1757,3 +1882,168 @@ def test_should_compress_empty_stream():
         source_length=len(content),
         source_size=len(content),
     )
+
+
+@pytest.mark.parametrize(
+    'stream_type',
+    ['bytesio', 'packed_object_reader', 'callback_wrapper', 'zlib_decompresser'],
+)
+def test_all_streams_readline_readlines(tmp_path, stream_type):
+    """Parametrized test for readline/readlines across all StreamSeekBytesType classes.
+
+    This test ensures that all stream types support readline() and readlines() methods
+    with consistent behavior.
+    """
+    # Content with exactly 3 newlines as requested
+    content = b'line1\nline2\nline3\nlast'
+    expected_lines = [b'line1\n', b'line2\n', b'line3\n', b'last']
+
+    # readline() returns the lines one by one, then b'' at EOF
+    stream, closer = _build_readable_stream(stream_type, content, tmp_path)
+    try:
+        for expected in expected_lines:
+            assert stream.readline() == expected, f'Failed for {stream_type}: {expected!r}'
+        assert stream.readline() == b'', f'Failed for {stream_type}: EOF'
+    finally:
+        closer()
+
+    # readlines() returns all lines at once (on a fresh stream)
+    stream, closer = _build_readable_stream(stream_type, content, tmp_path)
+    try:
+        assert stream.readlines() == expected_lines, f'Failed for {stream_type}: readlines()'
+    finally:
+        closer()
+
+
+def _build_readable_stream(stream_type, content, tmp_path):
+    """Construct a fresh readable stream of the given type over ``content``.
+
+    :return: a ``(stream, closer)`` tuple, where ``closer()`` releases any file handle.
+    """
+    if stream_type == 'bytesio':
+        return io.BytesIO(content), lambda: None
+    if stream_type == 'packed_object_reader':
+        pack_file = tmp_path / 'pack'
+        pack_file.write_bytes(content)
+        fhandle = open(pack_file, 'rb')
+        return utils.PackedObjectReader(fhandle, offset=0, length=len(content)), fhandle.close
+    if stream_type == 'callback_wrapper':
+        return utils.CallbackStreamWrapper(io.BytesIO(content), callback=None), lambda: None
+    if stream_type == 'zlib_decompresser':
+        compresser = utils.get_compressobj_instance('zlib+1')
+        compressed = compresser.compress(content) + compresser.flush()
+        return utils.ZlibStreamDecompresser(io.BytesIO(compressed)), lambda: None
+    raise ValueError(f'Unknown stream type {stream_type}')
+
+
+@pytest.mark.parametrize(
+    'stream_type',
+    ['bytesio', 'packed_object_reader', 'callback_wrapper', 'zlib_decompresser'],
+)
+def test_all_streams_readlines_hint(tmp_path, stream_type):
+    """``readlines(hint)`` returns whole lines until at least ``hint`` bytes are read."""
+    content = b'line1\nline2\nline3\nlast'
+
+    # hint smaller than the first line -> stop after the first line
+    # (positional arg: stdlib BytesIO.readlines does not accept a keyword)
+    stream, closer = _build_readable_stream(stream_type, content, tmp_path)
+    try:
+        assert stream.readlines(3) == [b'line1\n'], f'Failed for {stream_type}: hint=3'
+    finally:
+        closer()
+
+    # hint spanning into the second line -> first two lines
+    stream, closer = _build_readable_stream(stream_type, content, tmp_path)
+    try:
+        assert stream.readlines(8) == [b'line1\n', b'line2\n'], f'Failed for {stream_type}: hint=8'
+    finally:
+        closer()
+
+    # hint larger than the content -> read everything (loop exhausts the stream)
+    stream, closer = _build_readable_stream(stream_type, content, tmp_path)
+    try:
+        assert stream.readlines(1000) == [
+            b'line1\n',
+            b'line2\n',
+            b'line3\n',
+            b'last',
+        ], f'Failed for {stream_type}: hint > len(content)'
+    finally:
+        closer()
+
+
+def test_callback_stream_wrapper_readline(callback_instance):
+    """``readline`` on ``CallbackStreamWrapper`` reports the bytes read through the callback."""
+    content = b'aa\nbb\ncc\n'
+    wrapped = utils.CallbackStreamWrapper(
+        io.BytesIO(content), callback=callback_instance.callback, total_length=len(content)
+    )
+
+    lines = []
+    while True:
+        line = wrapped.readline()
+        if not line:
+            break
+        lines.append(line)
+    wrapped.close_callback()
+
+    assert lines == [b'aa\n', b'bb\n', b'cc\n']
+    # The callback must have accounted for every byte of the stream exactly once.
+    assert callback_instance.performed_actions == [
+        {
+            'start_value': {'total': len(content), 'description': 'Streamed object'},
+            'value': len(content),
+        },
+    ]
+
+
+@pytest.mark.parametrize(
+    'stream_type',
+    ['bytesio', 'packed_object_reader', 'callback_wrapper', 'zlib_decompresser'],
+)
+def test_all_streams_readline_size(tmp_path, stream_type):
+    """``readline(size)`` returns at most ``size`` bytes, stopping before the newline."""
+    content = b'a long first line that exceeds the size limit\nsecond\n'
+    stream, closer = _build_readable_stream(stream_type, content, tmp_path)
+    try:
+        # size shorter than the first line: truncated before the newline
+        first_chunk = stream.readline(10)
+        assert first_chunk == content[:10], f'Failed for {stream_type}: readline(10)'
+        # the remainder of the first line is returned by the next (unbounded) readline
+        assert (
+            first_chunk + stream.readline() == b'a long first line that exceeds the size limit\n'
+        ), f'Failed for {stream_type}: remainder'
+    finally:
+        closer()
+
+
+def test_lazy_loose_stream_readline_readlines(temp_container):
+    """``LazyLooseStream`` proxies read/readline/readlines to the materialised loose file."""
+    content = b'alpha\nbeta\ngamma\ndelta\n'
+    hashkey = temp_container.add_object(content)
+    temp_container.pack_all_loose(compress=True)
+
+    lazy = utils.LazyLooseStream(temp_container, hashkey)
+    assert lazy.closed
+    with lazy:
+        assert not lazy.closed
+        assert lazy.readline() == b'alpha\n'
+        assert lazy.readlines() == [b'beta\n', b'gamma\n', b'delta\n']
+        assert lazy.read() == b''  # at EOF
+    assert lazy.closed
+
+
+def test_compressed_stream_readline_after_backward_seek(temp_container):
+    """After a backward seek a compressed stream switches to its loose copy for readline."""
+    content = b'alpha\nbeta\ngamma\ndelta\n'
+    hashkey = temp_container.add_object(content)
+    temp_container.pack_all_loose(compress=True)
+
+    with temp_container.get_object_stream(hashkey) as stream:
+        assert isinstance(stream, utils.ZlibLikeBaseStreamDecompresser)
+        # Read forward, then seek backwards: this materialises the uncompressed loose stream.
+        assert stream.read(8) == b'alpha\nbe'
+        stream.seek(-8, 1)
+        # readline/readlines now delegate to the loose stream.
+        assert stream.readline() == b'alpha\n'
+        assert stream.readlines() == [b'beta\n', b'gamma\n', b'delta\n']

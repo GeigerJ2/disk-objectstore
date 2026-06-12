@@ -12,10 +12,10 @@ import os
 import shutil
 import uuid
 from collections import defaultdict, namedtuple
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, overload
+from typing import TYPE_CHECKING, BinaryIO, overload
 
 from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.orm.session import Session
@@ -576,7 +576,7 @@ class Container:  # pylint: disable=too-many-public-methods
         # to order in python instead
         session = self._get_operation_session()
 
-        obj_reader: StreamReadBytesType
+        obj_reader: StreamSeekBytesType
 
         if len(hashkeys_set) <= self._MAX_CHUNK_ITERATE_LENGTH:
             # Operate in chunks, due to the SQLite limits
@@ -1541,7 +1541,7 @@ class Container:  # pylint: disable=too-many-public-methods
         )
 
         # Close the callback so the bar doesn't remain open
-        streams[0].close_callback()  # type: ignore[union-attr]
+        streams[0].close_callback()  # type: ignore[attr-defined]
 
         return retval[0]
 
@@ -1599,7 +1599,7 @@ class Container:  # pylint: disable=too-many-public-methods
 
         # Make a copy of the list and revert its order, so we can pop from the list
         # without affecting the original list, and it's from the end so it's fast
-        working_stream_list = list(stream_list[::-1])
+        working_stream_list: list[StreamSeekBytesType | LazyOpener] = list(stream_list[::-1])
         pack_int_id = self._get_pack_id_to_write_to()
         session = self._get_operation_session()
 
@@ -1688,10 +1688,11 @@ class Container:  # pylint: disable=too-many-public-methods
                     # Get next stream, possibly preparing it to be open, or wrapping it
                     # if it is already open so it does not get open again
                     next_stream = working_stream_list.pop()
+                    stream_context_manager: AbstractContextManager[StreamSeekBytesType | BinaryIO]
                     if open_streams:
                         stream_context_manager = next_stream
                     else:
-                        stream_context_manager = nullcontext(next_stream)  # type: ignore[assignment]
+                        stream_context_manager = nullcontext(next_stream)
 
                     if callback:
                         since_last_update += 1
